@@ -4,6 +4,8 @@ const axios = require("axios");
 const cheerio = require("cheerio");
 const cors = require("cors");
 
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"; // Ignore SSL errors for some feeds (optional)
+
 const app = express();
 const parser = new Parser({
   customFields: {
@@ -49,24 +51,20 @@ function cleanPubDate(pubDate = "") {
 // ================= IMAGE FETCH =================
 async function fetchArticleImage(url, contentHtml = "") {
   try {
-    const { data } = await axios.get(url, { timeout: 8000 });
+    const { data } = await axios.get(url, { timeout: 12000 });
     const $ = cheerio.load(data);
 
-    // 1️⃣ OpenGraph / Twitter
     const ogImage =
       $('meta[property="og:image"]').attr("content") ||
       $('meta[name="twitter:image"]').attr("content");
     if (ogImage) return ogImage;
 
-    // 2️⃣ First image in article
     const articleImg = $("article img").first().attr("src");
     if (articleImg) return articleImg;
 
-    // 3️⃣ Any image in HTML
     const anyImg = $("img").first().attr("src");
     if (anyImg) return anyImg;
 
-    // 4️⃣ Fallback from content:encoded
     if (contentHtml) {
       const $c = cheerio.load(contentHtml);
       const contentImg = $c("img").first().attr("src");
@@ -75,14 +73,26 @@ async function fetchArticleImage(url, contentHtml = "") {
 
     return "";
   } catch (e) {
-    console.log("❌ Failed to fetch image:", url, e.message);
+    console.log("❌ Image fetch failed:", url, e.message);
     return "";
   }
 }
 
+// ================= RETRY FEED FETCH =================
+async function fetchFeedWithRetry(url, retries = 2) {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await parser.parseURL(url);
+    } catch (e) {
+      console.log(`⚠ Retry ${i + 1} failed for ${url}`);
+    }
+  }
+  return null;
+}
+
 // ================= CACHE =================
 let CACHE = { data: null, time: 0 };
-const CACHE_DURATION = 10 * 60 * 1000;
+const CACHE_DURATION = 10 * 60 * 1000; // 10 min
 
 // ================= ROUTE =================
 app.get("/news", async (req, res) => {
@@ -107,18 +117,21 @@ app.get("/news", async (req, res) => {
     await Promise.all(
       FEEDS.map(async feed => {
         try {
-          const feedData = await parser.parseURL(feed.url);
+          const feedData = await fetchFeedWithRetry(feed.url);
+          if (!feedData) {
+            console.log(`❌ All retries failed: ${feed.name}`);
+            return;
+          }
+
           const items = feedData.items.slice(0, 6);
 
           const feedArticles = await Promise.all(
             items.map(async item => {
-              // ✅ Prefer RSS media first
               let image =
                 item.enclosure?.url ||
                 item["media:content"]?.url ||
                 "";
 
-              // ✅ Fallback to article / content
               if (!image && item.link) {
                 image = await fetchArticleImage(item.link, item["content:encoded"] || "");
               }
@@ -139,18 +152,16 @@ app.get("/news", async (req, res) => {
           );
 
           articles.push(...feedArticles);
-        } catch {
-          console.log(`❌ Failed: ${feed.name}`);
+        } catch (e) {
+          console.log(`❌ Failed feed processing: ${feed.name}`, e.message);
         }
       })
     );
 
     articles.sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
 
-    // Save to cache
     CACHE = { data: articles, time: Date.now() };
 
-    // Filter requested category (general = all news)
     if (requestedCategory && requestedCategory !== "general") {
       articles = articles.filter(a => a.category === requestedCategory);
     }
@@ -161,6 +172,7 @@ app.get("/news", async (req, res) => {
       articles
     });
   } catch (e) {
+    console.log(e);
     res.status(500).json({ status: "error", message: "Failed to fetch news" });
   }
 });
