@@ -5,13 +5,16 @@ const cheerio = require("cheerio");
 const cors = require("cors");
 
 const app = express();
+
 const parser = new Parser({
-  customFields: { item: ["media:content", "enclosure", "content:encoded"] }
+  customFields: {
+    item: ["media:content", "enclosure", "content:encoded"]
+  }
 });
 
 app.use(cors());
 
-// All Nepali news feeds with optional profile logos
+// ================= FEEDS =================
 const FEEDS = [
   { name: "Baahrakhari", url: "https://baahrakhari.com/feed", profile: "" },
   { name: "OnlineKhabar", url: "https://www.onlinekhabar.com/feed", profile: "https://www.ashesh.org/app/news/logo/onlinekhabar.jpg" },
@@ -22,77 +25,136 @@ const FEEDS = [
   { name: "Rajdhani", url: "https://rajdhanidaily.com/feed", profile: "" },
   { name: "NewsOfNepal", url: "https://newsofnepal.com/feed", profile: "" },
   { name: "BizMandu", url: "https://bizmandu.com/feed", profile: "https://www.ashesh.org/app/news/logo/bizmandu.jpg" },
-  { name: "Ujyaalo Online", url: "https://www.ujyaaloonline.com/feed", profile: "" },
   { name: "Techpana", url: "https://techpana.com/feed", profile: "https://www.ashesh.org/app/news/logo/techpana.jpg" },
-  { name: "ImageKhabar", url: "https://www.imagekhabar.com/index.xml", profile: "https://www.ashesh.org/app/news/logo/imagekhabar.jpg" },
+  {
+    name: "SwasthyaKhabar",
+    url: "https://swasthyakhabar.com/feed",
+    profile: "https://swasthyakhabar.com/wp-content/uploads/2020/01/logo.png"
+  },
+  {
+    name: "Nagarik News",
+    url: "https://nagariknews.nagariknetwork.com/feed",
+    profile: "https://staticcdn.nagariknetwork.com/images/default-image.png"
+  },
   { name: "BBC Nepali", url: "https://www.bbc.com/nepali/index.xml", profile: "https://news.bbcimg.co.uk/nol/shared/img/bbc_news_120x60.gif" }
 ];
 
-// Clean text helper
+// ================= CATEGORY MAP =================
+const SOURCE_CATEGORY = {
+  Techpana: "प्रविधि",
+  BizMandu: "अर्थ",
+  SwasthyaKhabar: "स्वास्थ्य",
+  "BBC Nepali": "अन्तर्राष्ट्रिय"
+};
+
+// ================= HELPERS =================
 function cleanText(text = "") {
   return text
     .replace(/<[^>]*>/g, "")
     .replace(/&nbsp;/gi, " ")
-    .replace(/[\n\r\t]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-// Scrape article page for image
+function cleanPubDate(pubDate = "") {
+  return pubDate.replace(/[\n\r\t]/g, " ").trim();
+}
+
 async function fetchArticleImage(url) {
   try {
-    const { data } = await axios.get(url);
+    const { data } = await axios.get(url, { timeout: 4000 });
     const $ = cheerio.load(data);
-    const ogImage = $('meta[property="og:image"]').attr("content");
-    if (ogImage) return ogImage;
-    const img = $("article img").first().attr("src");
-    return img || "";
+    const og = $('meta[property="og:image"]').attr("content") ||
+               $('meta[name="twitter:image"]').attr("content");
+    if (og) return og;
+    return $("article img").first().attr("src") || $("img").first().attr("src") || "";
   } catch {
     return "";
   }
 }
 
+// ================= CACHE =================
+let CACHE = { data: null, time: 0 };
+const CACHE_DURATION = 10 * 60 * 1000; // 10 min
+
+// ================= ROUTE =================
 app.get("/news", async (req, res) => {
   try {
+    let requestedCategories = req.query.category;
+    if (requestedCategories) {
+      requestedCategories = requestedCategories.split(",").map(c => c.trim());
+    }
+
+    if (CACHE.data && Date.now() - CACHE.time < CACHE_DURATION) {
+      let cachedArticles = CACHE.data;
+      if (requestedCategories) {
+        cachedArticles = cachedArticles.filter(a => requestedCategories.includes(a.category));
+      }
+      return res.json({
+        status: "ok",
+        totalResults: cachedArticles.length,
+        articles: cachedArticles
+      });
+    }
+
     let articles = [];
 
-    // Loop through all feeds
-    for (const feed of FEEDS) {
+    await Promise.all(FEEDS.map(async feed => {
       try {
-        const data = await parser.parseURL(feed.url);
+        const feedData = await parser.parseURL(feed.url);
+        const items = feedData.items.slice(0, 6);
 
-        for (const item of data.items) {
+        const feedArticles = await Promise.all(items.map(async item => {
           let image = item.enclosure?.url || item["media:content"]?.url || "";
-
-          // If no image in RSS, scrape article page
           if (!image && item.link) {
             image = await fetchArticleImage(item.link);
           }
 
-          articles.push({
-            source: feed.name,
+          const category = item.categories?.[0] || SOURCE_CATEGORY[feed.name] || "समाचार";
+
+          return {
+            source: { id: null, name: feed.name },  // NewsAPI format
+            category,
+            author: item.creator || null,
             title: cleanText(item.title),
-            link: cleanText(item.link),
             description: cleanText(item.contentSnippet || item.content || ""),
-            image: image || "",
-            pubDate: cleanText(item.pubDate),
-            profile: feed.profile || ""
-          });
-        }
-      } catch (e) {
-        console.error(`❌ Failed to fetch feed: ${feed.name}`);
+            url: item.link,
+            urlToImage: image || null,
+            publishedAt: new Date(cleanPubDate(item.pubDate)).toISOString(),
+            content: cleanText(item.content || "")
+          };
+        }));
+
+        articles.push(...feedArticles);
+      } catch {
+        console.log(`❌ Failed: ${feed.name}`);
       }
+    }));
+
+    articles.sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
+    CACHE.data = articles;
+    CACHE.time = Date.now();
+
+    if (requestedCategories) {
+      articles = articles.filter(a => requestedCategories.includes(a.category));
     }
 
-    // Sort by latest first
-    articles.sort((a, b) => new Date(b.pubDate) - new Date(a.pubDate));
+    res.json({
+      status: "ok",
+      totalResults: articles.length,
+      articles
+    });
 
-    res.json({ status: "success", total: articles.length, articles });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ status: "error", message: "Failed to fetch news" });
+  } catch {
+    res.status(500).json({
+      status: "error",
+      message: "Failed to fetch news"
+    });
   }
 });
 
+// ================= START =================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Nepali News API running → http://localhost:${PORT}/news`));
+app.listen(PORT, () =>
+  console.log(`✅ Ultra-fast News API → http://localhost:${PORT}/news`)
+);
