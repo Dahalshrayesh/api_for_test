@@ -16,27 +16,19 @@ app.use(cors());
 
 // ================= FEEDS =================
 const FEEDS = [
-  { name: "Baahrakhari", url: "https://baahrakhari.com/feed", profile: "" },
-  { name: "OnlineKhabar", url: "https://www.onlinekhabar.com/feed", profile: "https://www.ashesh.org/app/news/logo/onlinekhabar.jpg" },
-  { name: "Ratopati", url: "https://www.ratopati.com/feed", profile: "" },
-  { name: "Setopati", url: "https://www.setopati.com/feed", profile: "https://www.ashesh.org/app/news/logo/setopati.jpg" },
-  { name: "ThahaKhabar", url: "https://www.thahakhabar.com/feed", profile: "" },
-  { name: "NepalSamaya", url: "https://nepalsamaya.com/feed", profile: "" },
-  { name: "Rajdhani", url: "https://rajdhanidaily.com/feed", profile: "" },
-  { name: "NewsOfNepal", url: "https://newsofnepal.com/feed", profile: "" },
-  { name: "BizMandu", url: "https://bizmandu.com/feed", profile: "https://www.ashesh.org/app/news/logo/bizmandu.jpg" },
-  { name: "Techpana", url: "https://techpana.com/feed", profile: "https://www.ashesh.org/app/news/logo/techpana.jpg" },
-  {
-    name: "SwasthyaKhabar",
-    url: "https://swasthyakhabar.com/feed",
-    profile: "https://swasthyakhabar.com/wp-content/uploads/2020/01/logo.png"
-  },
-  {
-    name: "Nagarik News",
-    url: "https://nagariknews.nagariknetwork.com/feed",
-    profile: "https://staticcdn.nagariknetwork.com/images/default-image.png"
-  },
-  { name: "BBC Nepali", url: "https://www.bbc.com/nepali/index.xml", profile: "https://news.bbcimg.co.uk/nol/shared/img/bbc_news_120x60.gif" }
+  { name: "Baahrakhari", url: "https://baahrakhari.com/feed" },
+  { name: "OnlineKhabar", url: "https://www.onlinekhabar.com/feed" },
+  { name: "Ratopati", url: "https://www.ratopati.com/feed" },
+  { name: "Setopati", url: "https://www.setopati.com/feed" },
+  { name: "ThahaKhabar", url: "https://www.thahakhabar.com/feed" },
+  { name: "NepalSamaya", url: "https://nepalsamaya.com/feed" },
+  { name: "Rajdhani", url: "https://rajdhanidaily.com/feed" },
+  { name: "NewsOfNepal", url: "https://newsofnepal.com/feed" },
+  { name: "BizMandu", url: "https://bizmandu.com/feed" },
+  { name: "Techpana", url: "https://techpana.com/feed" },
+  { name: "SwasthyaKhabar", url: "https://swasthyakhabar.com/feed" },
+  { name: "Nagarik News", url: "https://nagariknews.nagariknetwork.com/feed" },
+  { name: "BBC Nepali", url: "https://www.bbc.com/nepali/index.xml" }
 ];
 
 // ================= CATEGORY MAP =================
@@ -56,18 +48,41 @@ function cleanText(text = "") {
     .trim();
 }
 
-function cleanPubDate(pubDate = "") {
-  return pubDate.replace(/[\n\r\t]/g, " ").trim();
+function extractImageFromContent(html = "") {
+  const match = html.match(/<img[^>]+src="([^">]+)"/i);
+  return match ? match[1] : "";
+}
+
+function fixRelativeUrl(img, pageUrl) {
+  if (!img) return "";
+  if (img.startsWith("http")) return img;
+  if (img.startsWith("/")) {
+    const u = new URL(pageUrl);
+    return `${u.protocol}//${u.host}${img}`;
+  }
+  return img;
 }
 
 async function fetchArticleImage(url) {
   try {
-    const { data } = await axios.get(url, { timeout: 4000 });
+    const { data } = await axios.get(url, {
+      timeout: 8000,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9"
+      }
+    });
+
     const $ = cheerio.load(data);
-    const og = $('meta[property="og:image"]').attr("content") ||
-               $('meta[name="twitter:image"]').attr("content");
-    if (og) return og;
-    return $("article img").first().attr("src") || $("img").first().attr("src") || "";
+
+    let img =
+      $('meta[property="og:image"]').attr("content") ||
+      $('meta[name="twitter:image"]').attr("content") ||
+      $("article img").first().attr("src") ||
+      $("img").first().attr("src");
+
+    return fixRelativeUrl(img, url);
   } catch {
     return "";
   }
@@ -86,15 +101,11 @@ app.get("/news", async (req, res) => {
     }
 
     if (CACHE.data && Date.now() - CACHE.time < CACHE_DURATION) {
-      let cachedArticles = CACHE.data;
+      let data = CACHE.data;
       if (requestedCategories) {
-        cachedArticles = cachedArticles.filter(a => requestedCategories.includes(a.category));
+        data = data.filter(a => requestedCategories.includes(a.category));
       }
-      return res.json({
-        status: "ok",
-        totalResults: cachedArticles.length,
-        articles: cachedArticles
-      });
+      return res.json({ status: "ok", totalResults: data.length, articles: data });
     }
 
     let articles = [];
@@ -102,25 +113,38 @@ app.get("/news", async (req, res) => {
     await Promise.all(FEEDS.map(async feed => {
       try {
         const feedData = await parser.parseURL(feed.url);
-        const items = feedData.items.slice(0, 6);
+        const items = feedData.items.slice(0, 4); // limit for stability
 
         const feedArticles = await Promise.all(items.map(async item => {
-          let image = item.enclosure?.url || item["media:content"]?.url || "";
+          let image =
+            item.enclosure?.url ||
+            item["media:content"]?.url ||
+            extractImageFromContent(item["content:encoded"]);
+
+          if (image) image = fixRelativeUrl(image, item.link);
+
           if (!image && item.link) {
             image = await fetchArticleImage(item.link);
           }
 
-          const category = item.categories?.[0] || SOURCE_CATEGORY[feed.name] || "समाचार";
+          if (!image) {
+            image = "https://via.placeholder.com/800x450?text=News";
+          }
+
+          const category =
+            item.categories?.[0] ||
+            SOURCE_CATEGORY[feed.name] ||
+            "समाचार";
 
           return {
-            source: { id: null, name: feed.name },  // NewsAPI format
+            source: { id: null, name: feed.name },
             category,
             author: item.creator || null,
             title: cleanText(item.title),
             description: cleanText(item.contentSnippet || item.content || ""),
             url: item.link,
-            urlToImage: image || null,
-            publishedAt: new Date(cleanPubDate(item.pubDate)).toISOString(),
+            urlToImage: image,
+            publishedAt: new Date(item.pubDate || Date.now()).toISOString(),
             content: cleanText(item.content || "")
           };
         }));
@@ -132,8 +156,8 @@ app.get("/news", async (req, res) => {
     }));
 
     articles.sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
-    CACHE.data = articles;
-    CACHE.time = Date.now();
+
+    CACHE = { data: articles, time: Date.now() };
 
     if (requestedCategories) {
       articles = articles.filter(a => requestedCategories.includes(a.category));
