@@ -5,7 +5,6 @@ const cheerio = require("cheerio");
 const cors = require("cors");
 
 const app = express();
-
 const parser = new Parser({
   customFields: {
     item: ["media:content", "enclosure", "content:encoded"]
@@ -35,7 +34,7 @@ const FEEDS = [
 const SOURCE_CATEGORY = {
   Techpana: "tech",
   SwasthyaKhabar: "health",
-  "BBC Nepali": "international",
+  "BBC Nepali": "international"
 };
 
 // ================= HELPERS =================
@@ -43,16 +42,40 @@ function cleanText(text = "") {
   return text.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
 }
 
-async function fetchArticleImage(url) {
+function cleanPubDate(pubDate = "") {
+  return pubDate.replace(/[\n\r\t]/g, " ").trim();
+}
+
+// ================= IMAGE FETCH =================
+async function fetchArticleImage(url, contentHtml = "") {
   try {
-    const { data } = await axios.get(url, { timeout: 4000 });
+    const { data } = await axios.get(url, { timeout: 8000 });
     const $ = cheerio.load(data);
-    return (
+
+    // 1️⃣ OpenGraph / Twitter
+    const ogImage =
       $('meta[property="og:image"]').attr("content") ||
-      $("img").first().attr("src") ||
-      ""
-    );
-  } catch {
+      $('meta[name="twitter:image"]').attr("content");
+    if (ogImage) return ogImage;
+
+    // 2️⃣ First image in article
+    const articleImg = $("article img").first().attr("src");
+    if (articleImg) return articleImg;
+
+    // 3️⃣ Any image in HTML
+    const anyImg = $("img").first().attr("src");
+    if (anyImg) return anyImg;
+
+    // 4️⃣ Fallback from content:encoded
+    if (contentHtml) {
+      const $c = cheerio.load(contentHtml);
+      const contentImg = $c("img").first().attr("src");
+      if (contentImg) return contentImg;
+    }
+
+    return "";
+  } catch (e) {
+    console.log("❌ Failed to fetch image:", url, e.message);
     return "";
   }
 }
@@ -66,15 +89,12 @@ app.get("/news", async (req, res) => {
   try {
     let requestedCategory = req.query.category || null;
 
-    // ✅ Use cache
+    // Use cache
     if (CACHE.data && Date.now() - CACHE.time < CACHE_DURATION) {
       let result = CACHE.data;
-
-      // 🔥 IMPORTANT FIX: general = ALL NEWS
       if (requestedCategory && requestedCategory !== "general") {
         result = result.filter(a => a.category === requestedCategory);
       }
-
       return res.json({
         status: "ok",
         totalResults: result.length,
@@ -92,12 +112,17 @@ app.get("/news", async (req, res) => {
 
           const feedArticles = await Promise.all(
             items.map(async item => {
+              // ✅ Prefer RSS media first
               let image =
                 item.enclosure?.url ||
                 item["media:content"]?.url ||
-                (item.link ? await fetchArticleImage(item.link) : "");
+                "";
 
-              // ✅ CATEGORY LOGIC (FIXED)
+              // ✅ Fallback to article / content
+              if (!image && item.link) {
+                image = await fetchArticleImage(item.link, item["content:encoded"] || "");
+              }
+
               const category = SOURCE_CATEGORY[feed.name] || "general";
 
               return {
@@ -107,7 +132,7 @@ app.get("/news", async (req, res) => {
                 description: cleanText(item.contentSnippet || ""),
                 url: item.link,
                 urlToImage: image || null,
-                publishedAt: new Date(item.pubDate).toISOString(),
+                publishedAt: new Date(cleanPubDate(item.pubDate)).toISOString(),
                 content: cleanText(item.content || "")
               };
             })
@@ -122,9 +147,10 @@ app.get("/news", async (req, res) => {
 
     articles.sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
 
+    // Save to cache
     CACHE = { data: articles, time: Date.now() };
 
-    // 🔥 SAME FIX AFTER FETCH
+    // Filter requested category (general = all news)
     if (requestedCategory && requestedCategory !== "general") {
       articles = articles.filter(a => a.category === requestedCategory);
     }
